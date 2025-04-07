@@ -1,0 +1,444 @@
+import anndata as ad
+import numpy as np
+import networkx as nx
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+import scanpy as sc
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import sklearn.metrics.pairwise
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.neighbors import NearestNeighbors
+
+# Load .h5ad dataset
+file_path = "D:/Alignment/Data/starmap/starmap_3d_mouse_brain.h5ad"
+adata = ad.read_h5ad(file_path)
+
+
+adata_0 = adata[adata.obs['slice'] == 1].copy()  # 样本 0
+adata_1 = adata[adata.obs['slice'] == 2].copy()  # 样本 1
+
+# Extract common genes between the two samples
+def extract_common_genes(adata_0, adata_1):
+    adata_0.var_names_make_unique()
+    adata_1.var_names_make_unique()
+
+    genes_0 = set(adata_0.var_names)
+    genes_1 = set(adata_1.var_names)
+
+    common_genes = genes_0.intersection(genes_1)
+
+    adata_0_common = adata_0[:, list(common_genes)].copy()
+    adata_1_common = adata_1[:, list(common_genes)].copy()
+
+    return adata_0_common, adata_1_common
+
+adata_0, adata_1 = extract_common_genes(adata_0, adata_1)
+
+# Select highly variable genes and preprocess
+def process_highly_variable_genes(adata):
+    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    return adata
+
+adata_0 = process_highly_variable_genes(adata_0)
+adata_1 = process_highly_variable_genes(adata_1)
+
+features_0 = adata_0.X.toarray() if sp.issparse(adata_0.X) else adata_0.X  # 样本 0 特征
+features_1 = adata_1.X.toarray() if sp.issparse(adata_1.X) else adata_1.X  # 样本 1 特征
+
+spatial_coords_0 = adata_0.obsm['spatial']  
+spatial_coords_1 = adata_1.obsm['spatial']  
+
+labels_0 = adata_0.obs['cell_types']  # 样本 0 标签
+labels_1 = adata_1.obs['cell_types']  # 样本 1 标签
+
+# Build spatial-feature graph
+def build_graph(spatial_coords, features, distance_threshold=100):
+    n_nodes = spatial_coords.shape[0]
+    graph = nx.Graph()
+
+    if isinstance(spatial_coords, pd.DataFrame):
+        spatial_coords = spatial_coords.to_numpy()
+
+    for i in range(n_nodes):
+        graph.add_node(i, features=features[i], coords=spatial_coords[i])
+
+    distances = cdist(spatial_coords, spatial_coords)
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if distances[i, j] < distance_threshold:
+                graph.add_edge(i, j, weight=distances[i, j])
+
+    return graph
+
+G_0 = build_graph(spatial_coords_0, features_0)
+G_1 = build_graph(spatial_coords_1, features_1)
+
+# Compute hybrid similarity matrix
+def compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1, alpha=1):
+    feature_distances = cdist(features_0, features_1, metric='euclidean')
+    spatial_distances = cdist(spatial_coords_0, spatial_coords_1, metric='euclidean')
+
+    max_feature_dist = np.max(feature_distances)
+    max_spatial_dist = np.max(spatial_distances)
+
+    feature_sim = 1 - (feature_distances / max_feature_dist)
+    spatial_sim = 1 - (spatial_distances / max_spatial_dist)
+
+    similarity_matrix = alpha * feature_sim + (1 - alpha) * spatial_sim
+    return similarity_matrix
+
+similarity_matrix = compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1)
+
+# Hungarian algorithm for initial node matching
+row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
+
+# Initial transport matrix
+initial_matching_matrix = np.zeros_like(similarity_matrix)
+initial_matching_matrix[row_ind, col_ind] = 1
+
+# Extract most similar node pairs and edges
+def extract_similar_subgraph(G_0, G_1, row_ind, col_ind, similarity_matrix, top_percent=100):
+    matched_pairs = [(i, j, similarity_matrix[i, j]) for i, j in zip(row_ind, col_ind)]
+    matched_pairs.sort(key=lambda x: x[2], reverse=True)
+
+    num_pairs = len(matched_pairs)
+    num_top_pairs = int(num_pairs * top_percent / 100)
+    selected_pairs = matched_pairs[:num_top_pairs]
+
+    subgraph_0 = nx.Graph()
+    subgraph_1 = nx.Graph()
+
+    for i, j, _ in selected_pairs:
+        subgraph_0.add_node(i, features=G_0.nodes[i]['features'], coords=G_0.nodes[i]['coords'])
+        subgraph_1.add_node(j, features=G_1.nodes[j]['features'], coords=G_1.nodes[j]['coords'])
+
+    for i, j, _ in selected_pairs:
+        for neighbor in G_0.neighbors(i):
+            if neighbor in subgraph_0.nodes:
+                subgraph_0.add_edge(i, neighbor, weight=G_0[i][neighbor]['weight'])
+
+        for neighbor in G_1.neighbors(j):
+            if neighbor in subgraph_1.nodes:
+                subgraph_1.add_edge(j, neighbor, weight=G_1[j][neighbor]['weight'])
+
+    return subgraph_0, subgraph_1, selected_pairs
+
+subgraph_0, subgraph_1, matched_pairs = extract_similar_subgraph(
+    G_0, G_1, row_ind, col_ind, similarity_matrix, top_percent=100
+)
+
+
+# Convert spatial coordinates to torch.Tensor
+template_points = torch.from_numpy(spatial_coords_0.to_numpy()).float()
+target_points = torch.from_numpy(spatial_coords_1.to_numpy()).float()
+
+# Construct k-NN edge list for stiffness regularization
+def compute_edges(points, k=4):
+    """
+    Compute k-nearest neighbors to form edge list.
+    Args:
+        points: (N, 2) Tensor of points.
+        k: Number of neighbors per point.
+    Returns:
+        edges: (E, 2) LongTensor edge list.
+    """
+    points_np = points.cpu().numpy()
+    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='auto').fit(points_np)
+    distances, indices = nbrs.kneighbors(points_np)
+    edges = []
+    for i in range(points_np.shape[0]):
+        for j in indices[i][1:]:  
+            edges.append([i, j])
+    edges = np.array(edges)
+    return torch.from_numpy(edges).long()
+
+template_edges = compute_edges(template_points, k=4)
+
+# Send data to CUDA if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+template_points = template_points.to(device)
+target_points = target_points.to(device)
+template_edges = template_edges.to(device)
+
+# Get matched node indices
+matched_template_indices = [pair[0] for pair in matched_pairs]
+matched_target_indices = [pair[1] for pair in matched_pairs]
+
+
+# Define local affine transformation class
+class LocalAffine2D(nn.Module):
+    def __init__(self, num_points, edges=None):
+        super(LocalAffine2D, self).__init__()
+        # Initialize affine transformation parameters A and b for each point
+        self.A = nn.Parameter(torch.eye(2).unsqueeze(0).repeat(num_points, 1, 1))  # (N, 2, 2)
+        self.b = nn.Parameter(torch.zeros(num_points, 2, 1))  # (N, 2, 1)
+        self.edges = edges  # (E, 2)
+        self.num_points = num_points
+
+    def stiffness(self):
+        # Compute stiffness loss to encourage similar affine transforms for neighboring points
+        if self.edges is None:
+            raise Exception("edges cannot be None when computing stiffness loss")
+        idx1 = self.edges[:, 0]
+        idx2 = self.edges[:, 1]
+        affine_params = torch.cat((self.A, self.b), dim=2)  # (N, 2, 3)
+        w1 = affine_params[idx1]  # (E, 2, 3)
+        w2 = affine_params[idx2]
+        w_diff = (w1 - w2).pow(2).sum(dim=(1, 2))  # (E,)
+        return w_diff
+
+    def forward(self, x, return_stiff=False):
+        # Apply local affine transformation to input points
+        x = x.unsqueeze(2)  # (N, 2, 1)
+        out_x = torch.matmul(self.A, x) + self.b  # (N, 2, 1)
+        out_x = out_x.squeeze(2)  # (N, 2)
+        if return_stiff:
+            stiffness = self.stiffness()
+            return out_x, stiffness
+        else:
+            return out_x
+
+# Configuration dictionary
+config = {
+    'inner_iter': 5,
+    'outer_iter': 50,
+    'stiffness_weights': [1.0, 0.5],
+    'data_weights': [1.0, 1.0],
+    'milestones': [25],
+    'log_iter': 10,
+    'learning_rate': 1e-2,
+}
+
+# Main function: Normal ICP
+def non_rigid_icp_2d(
+    template_points: torch.Tensor,  # (N, 2), template point set
+    target_points: torch.Tensor,    # (M, 2), target point set
+    template_edges: torch.LongTensor,  # (E, 2), edges of the template points
+    matched_template_indices: list,  # matched indices from the template
+    matched_target_indices: list,    # matched indices from the target
+    config: dict
+):
+    """
+    Non-rigidly register the template_points to the target_points.
+    Returns:
+        new_deformed_points: (N, 2), the registered template point set.
+    """
+    device = template_points.device
+    num_points = template_points.shape[0]
+
+    matched_template_indices = torch.tensor(matched_template_indices, dtype=torch.long, device=device)
+    matched_target_indices = torch.tensor(matched_target_indices, dtype=torch.long, device=device)
+
+    template_sub_points = template_points[matched_template_indices]
+    target_sub_points = target_points[matched_target_indices]
+
+    # Initial rigid alignment (using Procrustes analysis)
+    # Compute centroids
+    template_center = template_sub_points.mean(dim=0, keepdim=True)
+    target_center = target_sub_points.mean(dim=0, keepdim=True)
+    # Centering
+    template_sub_centered = template_sub_points - template_center
+    target_sub_centered = target_sub_points - target_center
+    # Compute optimal rotation
+    H = template_sub_centered.T @ target_sub_centered
+    U, S, Vt = torch.svd(H)
+    R = Vt.T @ U.T
+    # Handle reflection
+    if torch.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    # Translation vector
+    t = target_center - template_center @ R
+    # Apply rotation and translation to all template points
+    transformed_points = (R @ template_points.T).T + t
+
+    # Define local affine transformation model
+    local_affine_model = LocalAffine2D(num_points, edges=template_edges).to(device)
+    optimizer = optim.AdamW(local_affine_model.parameters(), lr=config.get('learning_rate', 1e-3), amsgrad=True)
+
+    # Load configuration parameters
+    inner_iter = config.get('inner_iter', 10)
+    outer_iter = config.get('outer_iter', 100)
+    log_iter = config.get('log_iter', 10)
+    stiffness_weights = config.get('stiffness_weights', [1.0])
+    data_weights = config.get('data_weights', [1.0])
+    milestones = config.get('milestones', [])
+    w_idx = 0
+
+    # Start optimization process
+    for i in range(outer_iter):
+        # Apply current local affine transformation
+        new_deformed_points, stiffness = local_affine_model(transformed_points, return_stiff=True)
+
+        # Only compute data loss for matched points
+        matched_new_deformed_points = new_deformed_points[matched_template_indices]
+        matched_target_points = target_points[matched_target_indices]
+
+        # Find closest points in the target (already matched in fact)
+        distances = torch.cdist(matched_new_deformed_points.unsqueeze(0), matched_target_points.unsqueeze(0))
+        min_dist, min_idx = distances.min(dim=2)
+        close_points = matched_target_points
+
+        for _ in range(inner_iter):
+            optimizer.zero_grad()
+
+            # Data loss: distance between deformed template points and target points
+            data_loss = ((matched_new_deformed_points - close_points).pow(2).sum(dim=1)).mean() * data_weights[w_idx]
+
+            # Stiffness loss: encourage similar affine transforms for neighbors
+            stiffness_loss = stiffness.mean() * stiffness_weights[w_idx]
+
+            # Total loss
+            loss = data_loss + stiffness_loss
+            loss.backward()
+            optimizer.step()
+
+            # Update deformed points
+            new_deformed_points, stiffness = local_affine_model(transformed_points, return_stiff=True)
+            matched_new_deformed_points = new_deformed_points[matched_template_indices]
+
+        if i % log_iter == 0:
+            print(f"Iteration {i}: Data Loss = {data_loss.item():.6f}, Stiffness Loss = {stiffness_loss.item():.6f}")
+
+        # Update weight index
+        if i in milestones and w_idx < len(stiffness_weights) - 1:
+            w_idx += 1
+
+    return new_deformed_points
+
+
+# Perform non-rigid ICP
+aligned_template_points = non_rigid_icp_2d(
+    template_points,
+    target_points,
+    template_edges,
+    matched_template_indices,
+    matched_target_indices,
+    config
+)
+
+import os
+
+# Create output directory
+output_dir = "E:\\GMSA+"
+os.makedirs(output_dir, exist_ok=True)
+
+# Create label-to-color mapping
+label_colors = {
+    'Olig2': '#FF0000', 'Astro': '#00FF00', 'PV': '#0000FF',
+    'L5': '#FFFF00', 'Olig1': '#00FFFF', 'L6': '#FF00FF',
+    'L2/3': '#808080', 'L4': '#800000'
+}
+
+# Convert data to numpy arrays
+aligned_template_coords_np = aligned_template_points.cpu().detach().numpy()
+target_coords_np = target_points.cpu().numpy()
+template_coords_np = template_points.cpu().numpy()
+
+spatial_coords_0_np = spatial_coords_0.to_numpy()
+spatial_coords_1_np = spatial_coords_1.to_numpy()
+
+plt.figure(figsize=(6, 6))
+for label in np.unique(labels_0):
+    mask_0 = (labels_0 == label).to_numpy()
+    plt.scatter(spatial_coords_0_np[mask_0, 0], spatial_coords_0_np[mask_0, 1],
+                c=label_colors.get(label, '#000000'), label=f'{label} (template)', s=5)
+for label in np.unique(labels_1):
+    mask_1 = (labels_1 == label).to_numpy()
+    plt.scatter(spatial_coords_1_np[mask_1, 0], spatial_coords_1_np[mask_1, 1],
+                c=label_colors.get(label, '#000000'), label=f'{label} (target)', s=5, marker='x')
+plt.axis('off')
+first_image_path = os.path.join(output_dir, "initial_state.pdf")
+plt.savefig(first_image_path, dpi=300, bbox_inches='tight', format='pdf')
+plt.tight_layout()
+plt.show()
+
+
+plt.figure(figsize=(6, 6))
+for label in np.unique(labels_0):
+    mask_0 = (labels_0 == label).to_numpy()
+    plt.scatter(aligned_template_coords_np[mask_0, 0], aligned_template_coords_np[mask_0, 1],
+                c=label_colors.get(label, '#000000'), label=f'{label} (aligned template)', s=5)
+for label in np.unique(labels_1):
+    mask_1 = (labels_1 == label).to_numpy()
+    plt.scatter(target_coords_np[mask_1, 0], target_coords_np[mask_1, 1],
+                c=label_colors.get(label, '#000000'), label=f'{label} (target)', s=5, marker='x')
+plt.axis('off')
+plt.tight_layout()
+# Save the second figure as PDF
+second_image_path = os.path.join(output_dir, "aligned_state.pdf")
+plt.savefig(second_image_path, dpi=300, bbox_inches='tight', format='pdf')
+plt.show()
+
+def plot_single_sample(coords, labels, title, sample_label, filename):
+    """
+    Plot a single sample's points colored by label and save as PDF.
+    Parameters:
+        coords: coordinates of the sample
+        labels: cell type labels of the sample
+        title: figure title
+        sample_label: label for legend
+        filename: output file path (with extension)
+    """
+    plt.figure(figsize=(6, 6))
+
+
+    for label in np.unique(labels):
+        mask = (labels == label).to_numpy()
+        plt.scatter(coords[mask, 0], coords[mask, 1],
+                    c=label_colors.get(label, '#000000'), s=5, label=f'{label} ({sample_label})')
+
+    plt.axis('off')
+    plt.tight_layout()
+
+    plt.savefig(filename, format='pdf', dpi=300, bbox_inches='tight')
+    plt.close()
+
+# Visualize and save unaligned sample 0
+plot_single_sample(
+    spatial_coords_0_np,  
+    labels_0,
+    'unalign - sample 0',
+    'sample 0',
+    os.path.join(output_dir, "unalign_sample_0.pdf")
+)
+
+# Visualize and save unaligned sample 1
+plot_single_sample(
+    spatial_coords_1_np,  
+    labels_1,
+    'unalign - sample 1',
+    'sample 1',
+    os.path.join(output_dir, "unalign_sample_1.pdf")
+)
+
+# Visualize and save aligned sample 0
+plot_single_sample(
+    aligned_template_coords_np,  
+    labels_0,
+    'align - sample 0',
+    'sample 0',
+    os.path.join(output_dir, "align_sample_0.pdf")
+)
+
+# Visualize and save aligned sample 1
+plot_single_sample(
+    spatial_coords_1_np,  
+    labels_1,
+    'align - sample 1',
+    'sample 1',
+    os.path.join(output_dir, "align_sample_1.pdf")
+)
+
+
+
+
+
+
