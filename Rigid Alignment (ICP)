@@ -1,0 +1,23 @@
+# Compute optimal rotation & translation (rigid registration)
+def register_point_clouds(coords_0, coords_1):
+    centroid_0 = np.mean(coords_0, axis=0)
+    centroid_1 = np.mean(coords_1, axis=0)
+    centered_coords_0 = coords_0 - centroid_0
+    centered_coords_1 = coords_1 - centroid_1
+    H = np.dot(centered_coords_0.T, centered_coords_1)
+    U, S, Vt = np.linalg.svd(H)
+    R = np.dot(Vt.T, U.T)
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = np.dot(Vt.T, U.T)
+    t = centroid_1 - np.dot(R, centroid_0)
+    return R, t
+
+R, t = register_point_clouds(subgraph_coords_0, subgraph_coords_1)
+
+# Apply transformation to align sample 0 to sample 1
+def apply_transformation(spatial_coords, R, t):
+    return np.dot(spatial_coords, R.T) + t
+
+aligned_coords_0 = apply_transformation(spatial_coords_0, R, t)
+aligned_coords_1 = spatial_coords_1
