@@ -1,0 +1,35 @@
+# Generate alignment matrix
+# Store the aligned coordinates into a DataFrame
+df = pd.DataFrame(np.vstack([aligned_coords_0, aligned_coords_1]), columns=['aligned_x', 'aligned_y'])
+
+# Generate the alignment matrix
+coords = df[['aligned_x', 'aligned_y']].to_numpy()
+split_idx = adata_0.shape[0]
+alignment = sklearn.metrics.pairwise.euclidean_distances(coords[:split_idx], coords[split_idx:])
+alignment = np.exp(-alignment)
+
+
+# Spot-to-spot alignment accuracy evaluation function
+def cal_spot_to_spot_alignment_acc(alignment, gt):
+    gt = gt.to_numpy()
+    result = np.zeros_like(alignment)
+    for i in range(alignment.shape[0]):
+        result[i, np.argmax(alignment[i])] = 1
+
+    # Calculate the overlap between alignment matrix and ground truth matrix
+    s = (result * gt).sum()
+    acc = s / alignment.shape[1]
+    return acc
+
+
+# Construct the ground truth matrix gt_matrix
+gt_matrix = np.zeros((len(labels_0), len(labels_1)))
+for i in range(len(labels_0)):
+    for j in range(len(labels_1)):
+        if labels_0.iloc[i] == labels_1.iloc[j]:
+            gt_matrix[i, j] = 1
+
+# Evaluate using Spot-to-spot alignment accuracy
+spot_to_spot_acc = cal_spot_to_spot_alignment_acc(alignment, pd.DataFrame(gt_matrix))
+print("Spot-to-spot Alignment Accuracy: {:.2f}".format(spot_to_spot_acc))
+print("Spot-to-spot Alignment Accuracy 4: {:.4f}".format(spot_to_spot_acc))
