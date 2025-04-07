@@ -1,0 +1,103 @@
+# Define local affine transformation model for each point
+class LocalAffine2D(nn.Module):
+    def __init__(self, num_points, edges=None):
+        super(LocalAffine2D, self).__init__()
+        self.A = nn.Parameter(torch.eye(2).unsqueeze(0).repeat(num_points, 1, 1))  # (N, 2, 2)
+        self.b = nn.Parameter(torch.zeros(num_points, 2, 1))  # (N, 2, 1)
+        self.edges = edges
+
+    def stiffness(self):
+        # Compute smoothness loss: encourage similar affine transforms for neighboring points
+        if self.edges is None:
+            raise Exception("Edges must be provided for stiffness computation.")
+        idx1 = self.edges[:, 0]
+        idx2 = self.edges[:, 1]
+        affine_params = torch.cat((self.A, self.b), dim=2)  # (N, 2, 3)
+        w1 = affine_params[idx1]
+        w2 = affine_params[idx2]
+        w_diff = (w1 - w2).pow(2).sum(dim=(1, 2))
+        return w_diff
+
+    def forward(self, x, return_stiff=False):
+        # Apply local affine transform to input points
+        x = x.unsqueeze(2)  # (N, 2, 1)
+        out_x = torch.matmul(self.A, x) + self.b  # (N, 2, 1)
+        out_x = out_x.squeeze(2)  # (N, 2)
+        if return_stiff:
+            stiffness = self.stiffness()
+            return out_x, stiffness
+        else:
+            return out_x
+
+# Main non-rigid ICP function
+def non_rigid_icp_2d(
+    template_points: torch.Tensor,
+    target_points: torch.Tensor,
+    template_edges: torch.LongTensor,
+    matched_template_indices: list,
+    matched_target_indices: list,
+    config: dict
+):
+    """
+    Perform non-rigid registration (2D) using local affine transformation and stiffness regularization.
+    """
+    device = template_points.device
+    num_points = template_points.shape[0]
+
+    matched_template_indices = torch.tensor(matched_template_indices, dtype=torch.long, device=device)
+    matched_target_indices = torch.tensor(matched_target_indices, dtype=torch.long, device=device)
+
+    # Extract matched sub-points
+    template_sub_points = template_points[matched_template_indices]
+    target_sub_points = target_points[matched_target_indices]
+
+    # Initial alignment using Procrustes analysis (rigid transform)
+    template_center = template_sub_points.mean(dim=0, keepdim=True)
+    target_center = target_sub_points.mean(dim=0, keepdim=True)
+    template_sub_centered = template_sub_points - template_center
+    target_sub_centered = target_sub_points - target_center
+    H = template_sub_centered.T @ target_sub_centered
+    U, S, Vt = torch.svd(H)
+    R = Vt.T @ U.T
+    if torch.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = target_center - template_center @ R
+    transformed_points = (R @ template_points.T).T + t  # apply rigid transform
+
+    # Initialize local affine model
+    local_affine_model = LocalAffine2D(num_points, edges=template_edges).to(device)
+    optimizer = optim.AdamW(local_affine_model.parameters(), lr=config.get('learning_rate', 1e-2), amsgrad=True)
+
+    inner_iter = config.get('inner_iter', 5)
+    outer_iter = config.get('outer_iter', 50)
+    log_iter = config.get('log_iter', 10)
+    stiffness_weights = config.get('stiffness_weights', [1.0])
+    data_weights = config.get('data_weights', [1.0])
+    milestones = config.get('milestones', [])
+    w_idx = 0  # weight index
+
+    # Optimization loop
+    for i in range(outer_iter):
+        new_deformed_points, stiffness = local_affine_model(transformed_points, return_stiff=True)
+        matched_new_deformed = new_deformed_points[matched_template_indices]
+        matched_target = target_points[matched_target_indices]
+
+        for _ in range(inner_iter):
+            optimizer.zero_grad()
+            data_loss = ((matched_new_deformed - matched_target).pow(2).sum(dim=1)).mean() * data_weights[w_idx]
+            stiffness_loss = stiffness.mean() * stiffness_weights[w_idx]
+            loss = data_loss + stiffness_loss
+            loss.backward()
+            optimizer.step()
+
+            new_deformed_points, stiffness = local_affine_model(transformed_points, return_stiff=True)
+            matched_new_deformed = new_deformed_points[matched_template_indices]
+
+        if i % log_iter == 0:
+            print(f"Iter {i}: Data Loss = {data_loss.item():.6f}, Stiffness Loss = {stiffness_loss.item():.6f}")
+
+        if i in milestones and w_idx < len(stiffness_weights) - 1:
+            w_idx += 1
+
+    return new_deformed_points
