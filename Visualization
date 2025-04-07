@@ -1,0 +1,110 @@
+# Generate color map for annotation labels
+unique_labels_0 = np.unique(labels_0)
+unique_labels_1 = np.unique(labels_1)
+all_labels = np.union1d(unique_labels_0, unique_labels_1)
+num_labels = len(all_labels)
+cmap = plt.get_cmap('tab10')
+label_to_color = {label: cmap(i / num_labels) for i, label in enumerate(all_labels)}
+
+# Visualize original and aligned spatial positions
+def plot_sample(coords, labels, label_text, marker, suffix, filename):
+    plt.figure(figsize=(6, 6))
+    for label in np.unique(labels):
+        mask = (labels == label).to_numpy()
+        plt.scatter(coords[mask, 0], coords[mask, 1], c=label_to_color.get(label, '#000000'),
+                    label=f'{label} ({label_text})', s=5, marker=marker)
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300, bbox_inches='tight', format='pdf')
+    plt.close()
+
+# Save plots
+plot_sample(spatial_coords_0, labels_0, 'Template', 'o', 'unalign_0', os.path.join(output_dir, "unalign_sample_0.pdf"))
+plot_sample(spatial_coords_1, labels_1, 'Target', 'x', 'unalign_1', os.path.join(output_dir, "unalign_sample_1.pdf"))
+plot_sample(aligned_coords_0, labels_0, 'Aligned Template', 'o', 'align_0', os.path.join(output_dir, "align_sample_0.pdf"))
+plot_sample(aligned_coords_1, labels_1, 'Target', 'x', 'align_1', os.path.join(output_dir, "align_sample_1.pdf"))
+
+# Evaluate alignment correctness by nearest label match
+def evaluate_alignment_with_base(target_coords, aligned_coords, labels_target, labels_template):
+    alignment_status = []
+    for i, coord in enumerate(target_coords):
+        distances = np.linalg.norm(aligned_coords - coord, axis=1)
+        nearest_idx = np.argmin(distances)
+        if labels_target.iloc[i] == labels_template.iloc[nearest_idx]:
+            alignment_status.append('aligned')
+        else:
+            alignment_status.append('mis-aligned')
+    return alignment_status
+
+alignment_status = evaluate_alignment_with_base(aligned_coords_1, aligned_coords_0, labels_1, labels_0)
+
+# Plot alignment evaluation results
+def plot_alignment_status_with_base(target_coords, alignment_status, title, output_file=None):
+    plt.figure(figsize=(10, 10))
+    sns.scatterplot(x=target_coords[:, 0], y=target_coords[:, 1],
+                    hue=alignment_status, palette={'aligned': 'orange', 'mis-aligned': 'gray'}, s=40)
+    plt.gca().invert_yaxis()
+    plt.axis('off')
+    plt.legend(title="Alignment Status", fontsize=13, title_fontsize=15, loc='best')
+    if output_file:
+        plt.savefig(output_file, format='pdf', bbox_inches='tight', dpi=300)
+    plt.close()
+
+output_file = os.path.join(output_dir, "alignment_results_base_sample_1.pdf")
+plot_alignment_status_with_base(aligned_coords_1, alignment_status, "Alignment Results", output_file)
+
+import plotly.graph_objects as go
+
+# Match aligned template points to target points
+def get_aligned_indices(template_coords, target_coords):
+    distances = cdist(template_coords, target_coords, metric="euclidean")
+    aligned_template_indices = np.arange(distances.shape[0])
+    aligned_target_indices = np.argmin(distances, axis=1)
+    return aligned_template_indices, aligned_target_indices
+
+# Create label-to-label matching matrix
+def build_matching_table(labels_0, labels_1, aligned_template_indices, aligned_target_indices):
+    unique_labels_0 = sorted(np.unique(labels_0))
+    unique_labels_1 = sorted(np.unique(labels_1))
+    matching_table = pd.DataFrame(0, index=unique_labels_1, columns=unique_labels_0)
+    for idx_0, idx_1 in zip(aligned_template_indices, aligned_target_indices):
+        source_label = labels_0[idx_0]
+        target_label = labels_1[idx_1]
+        matching_table.loc[target_label, source_label] += 1
+    return matching_table
+
+# Generate Sankey diagram using Plotly
+def Sankey(matching_table, filter_num=0, color="red", title="", prefix=["E11.5E1S1", "E11.5E1S2"],
+           layout=[1300, 900], font_size=15, font_color="Black", save_name=None,
+           format="pdf", width=900, height=1000):
+    source, target, value = [], [], []
+    label_ref = [a + f"_{prefix[0]}" for a in matching_table.columns.to_list()]
+    label_query = [a + f"_{prefix[1]}" for a in matching_table.index.to_list()]
+    label_all = label_query + label_ref
+    label2index = dict(zip(label_all, list(range(len(label_all)))))
+    for i, query in enumerate(label_query):
+        for j, ref in enumerate(label_ref):
+            if int(matching_table.iloc[i, j]) > filter_num:
+                target.append(label2index[query])
+                source.append(label2index[ref])
+                value.append(int(matching_table.iloc[i, j]))
+    fig = go.Figure(
+        data=[
+            go.Sankey(
+                node=dict(pad=50, thickness=80, line=dict(color="green", width=0.5),
+                          label=label_all, color=color),
+                link=dict(source=source, target=target, value=value),
+            )
+        ],
+        layout=go.Layout(autosize=False, width=layout[0], height=layout[1]),
+    )
+    fig.update_layout(title_text="", showlegend=False,
+                      font=dict(family="Times New Roman", size=font_size, color=font_color))
+    if save_name is not None:
+        fig.write_image(save_name + f".{format}", width=width, height=height)
+    fig.show()
+
+# Run matching and Sankey plotting
+aligned_template_indices, aligned_target_indices = get_aligned_indices(aligned_coords_0, aligned_coords_1)
+matching_table = build_matching_table(np.array(labels_0), np.array(labels_1), aligned_template_indices, aligned_target_indices)
+Sankey(matching_table, filter_num=0, color="red", save_name="/home/tlf/results/STEREO/sankey_alignment_1", format="pdf")
