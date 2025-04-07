@@ -1,0 +1,103 @@
+# Load spatial transcriptomics datasets
+adata1 = sc.read_h5ad("/home/tlf/download/dowmsamplestereo/E11.5_E1S1_downsampled.h5ad")
+adata2 = sc.read_h5ad("/home/tlf/download/dowmsamplestereo/E11.5_E1S2_downsampled.h5ad")
+
+# Extract common genes between two samples
+def extract_common_genes(adata1, adata2):
+    adata1.var_names_make_unique()
+    adata2.var_names_make_unique()
+    genes1 = set(adata1.var_names)
+    genes2 = set(adata2.var_names)
+    common_genes = genes1.intersection(genes2)
+    adata1_common = adata1[:, list(common_genes)].copy()
+    adata2_common = adata2[:, list(common_genes)].copy()
+    return adata1_common, adata2_common
+
+adata1, adata2 = extract_common_genes(adata1, adata2)
+
+# Initial visualization of annotation labels
+sc.pl.spatial(adata1, color='annotation', spot_size=3, show=False)
+sc.pl.spatial(adata2, color='annotation', spot_size=3, show=False)
+
+# Check available metadata
+print(adata1.obs.keys())
+print(adata1.obs['annotation'].unique())
+print(adata1.obsm.keys())
+
+# Extract expression features and spatial coordinates
+features_0 = adata1.X.toarray() if sp.issparse(adata1.X) else adata1.X
+features_1 = adata2.X.toarray() if sp.issparse(adata2.X) else adata2.X
+spatial_coords_0 = adata1.obsm['spatial']
+spatial_coords_1 = adata2.obsm['spatial']
+
+# Extract ground-truth annotation labels
+labels_0 = adata1.obs['annotation'].astype(str)
+labels_1 = adata2.obs['annotation'].astype(str)
+
+# Compute pairwise distances using GPU (Euclidean)
+def compute_distances_torch(XA, XB, device='cuda:1'):
+    XA = torch.tensor(XA, device=device).float()
+    XB = torch.tensor(XB, device=device).float()
+    distances = torch.cdist(XA, XB, p=2)
+    return distances.cpu().numpy()
+
+# Build spatial-feature graph using distance threshold
+def build_graph(spatial_coords, features, distance_threshold=100):
+    n_nodes = spatial_coords.shape[0]
+    graph = nx.Graph()
+    for i in range(n_nodes):
+        graph.add_node(i, features=features[i], coords=spatial_coords[i])
+    distances = compute_distances_torch(spatial_coords, spatial_coords, device=device)
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if distances[i, j] < distance_threshold:
+                graph.add_edge(i, j, weight=distances[i, j])
+    return graph
+
+# Construct graphs for both samples
+G_0 = build_graph(spatial_coords_0, features_0)
+G_1 = build_graph(spatial_coords_1, features_1)
+
+# Compute similarity matrix (weighted sum of feature & spatial similarities)
+def compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1, alpha=0.8):
+    feature_distances = compute_distances_torch(features_0, features_1, device=device)
+    spatial_distances = compute_distances_torch(spatial_coords_0, spatial_coords_1, device=device)
+    max_feature_dist = np.max(feature_distances)
+    max_spatial_dist = np.max(spatial_distances)
+    feature_sim = 1 - (feature_distances / max_feature_dist)
+    spatial_sim = 1 - (spatial_distances / max_spatial_dist)
+    similarity_matrix = alpha * feature_sim + (1 - alpha) * spatial_sim
+    return similarity_matrix
+
+similarity_matrix = compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1)
+
+# Perform initial node matching using Hungarian algorithm
+row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
+
+# Extract subgraphs based on top matching pairs
+def extract_similar_subgraph(G_0, G_1, row_ind, col_ind, similarity_matrix, top_percent=100):
+    matched_pairs = [(i, j, similarity_matrix[i, j]) for i, j in zip(row_ind, col_ind)]
+    matched_pairs.sort(key=lambda x: x[2], reverse=True)
+    num_top_pairs = int(len(matched_pairs) * top_percent / 100)
+    selected_pairs = matched_pairs[:num_top_pairs]
+    subgraph_0 = nx.Graph()
+    subgraph_1 = nx.Graph()
+    for i, j, _ in selected_pairs:
+        subgraph_0.add_node(i, features=G_0.nodes[i]['features'], coords=G_0.nodes[i]['coords'])
+        subgraph_1.add_node(j, features=G_1.nodes[j]['features'], coords=G_1.nodes[j]['coords'])
+    for i, j, _ in selected_pairs:
+        for neighbor in G_0.neighbors(i):
+            if neighbor in subgraph_0.nodes:
+                subgraph_0.add_edge(i, neighbor, weight=G_0[i][neighbor]['weight'])
+        for neighbor in G_1.neighbors(j):
+            if neighbor in subgraph_1.nodes:
+                subgraph_1.add_edge(j, neighbor, weight=G_1[j][neighbor]['weight'])
+    return subgraph_0, subgraph_1, selected_pairs
+
+subgraph_0, subgraph_1, matched_pairs = extract_similar_subgraph(G_0, G_1, row_ind, col_ind, similarity_matrix)
+
+# Extract coordinates for matched subgraphs
+valid_indices_0 = [i for i, _, _ in matched_pairs if i < len(spatial_coords_0)]
+valid_indices_1 = [j for _, j, _ in matched_pairs if j < len(spatial_coords_1)]
+subgraph_coords_0 = np.array([spatial_coords_0[i] for i in valid_indices_0])
+subgraph_coords_1 = np.array([spatial_coords_1[j] for j in valid_indices_1])
