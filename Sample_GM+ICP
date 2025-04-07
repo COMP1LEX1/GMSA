@@ -1,1 +1,206 @@
+import anndata as ad
+import numpy as np
+import networkx as nx
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+import scanpy as sc
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+import os
 
+# Load the input .h5ad file
+file_path = "/home/tlf/data/starmap/starmap_3d_mouse_brain.h5ad"
+adata = ad.read_h5ad(file_path)
+adata_0 = adata[adata.obs['slice'] == 4].copy()  
+adata_1 = adata[adata.obs['slice'] == 5].copy()  
+
+
+# Extract common genes between two datasets
+def extract_common_genes(adata_0, adata_1):
+    adata_0.var_names_make_unique()
+    adata_1.var_names_make_unique()
+
+    genes_0 = set(adata_0.var_names)
+    genes_1 = set(adata_1.var_names)
+
+    common_genes = genes_0.intersection(genes_1)
+
+    adata_0_common = adata_0[:, list(common_genes)].copy()
+    adata_1_common = adata_1[:, list(common_genes)].copy()
+
+    return adata_0_common, adata_1_common
+
+
+adata_0, adata_1 = extract_common_genes(adata_0, adata_1)
+
+
+# Select highly variable genes and preprocess
+def process_highly_variable_genes(adata):
+    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    return adata
+
+adata_0 = process_highly_variable_genes(adata_0)
+adata_1 = process_highly_variable_genes(adata_1)
+
+features_0 = adata_0.X.toarray() if sp.issparse(adata_0.X) else adata_0.X  
+features_1 = adata_1.X.toarray() if sp.issparse(adata_1.X) else adata_1.X  
+
+spatial_coords_0 = adata_0.obsm['spatial']  
+spatial_coords_1 = adata_1.obsm['spatial'] 
+
+#  Build graph based on spatial distance
+def build_graph(spatial_coords, features, distance_threshold=100):
+    n_nodes = spatial_coords.shape[0]
+    graph = nx.Graph()
+
+    for i in range(n_nodes):
+        graph.add_node(i, features=features[i])
+
+    distances = cdist(spatial_coords, spatial_coords)
+    for i in range(n_nodes):
+        for j in range(i + 1, n_nodes):
+            if distances[i, j] < distance_threshold:
+                graph.add_edge(i, j, weight=distances[i, j])
+
+    return graph
+
+
+G_0 = build_graph(spatial_coords_0, features_0)
+G_1 = build_graph(spatial_coords_1, features_1)
+
+
+# Compute similarity matrix
+def compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1, alpha=1):
+    feature_distances = cdist(features_0, features_1, metric='euclidean')
+    spatial_distances = cdist(spatial_coords_0, spatial_coords_1, metric='euclidean')
+
+    max_feature_dist = np.max(feature_distances)
+    max_spatial_dist = np.max(spatial_distances)
+
+    feature_sim = 1 - (feature_distances / max_feature_dist)
+    spatial_sim = 1 - (spatial_distances / max_spatial_dist)
+
+    similarity_matrix = alpha * feature_sim + (1 - alpha) * spatial_sim
+    return similarity_matrix
+
+
+similarity_matrix = compute_similarity_matrix(features_0, features_1, spatial_coords_0, spatial_coords_1)
+
+# Hungarian algorithm for initial node matching
+row_ind, col_ind = linear_sum_assignment(-similarity_matrix)
+
+# Extract most similar matched pairs and subgraphs
+def extract_similar_subgraph(G_0, G_1, row_ind, col_ind, similarity_matrix, top_percent=100):
+    matched_pairs = [(i, j, similarity_matrix[i, j]) for i, j in zip(row_ind, col_ind)]
+    matched_pairs.sort(key=lambda x: x[2], reverse=True)
+
+    num_pairs = len(matched_pairs)
+    num_top_pairs = int(num_pairs * top_percent / 100)
+    selected_pairs = matched_pairs[:num_top_pairs]
+
+    subgraph_0 = nx.Graph()
+    subgraph_1 = nx.Graph()
+
+    for i, j, _ in selected_pairs:
+        subgraph_0.add_node(i, features=G_0.nodes[i]['features'])
+        subgraph_1.add_node(j, features=G_1.nodes[j]['features'])
+
+    for i, j, _ in selected_pairs:
+        for neighbor in G_0.neighbors(i):
+            if neighbor in subgraph_0.nodes:
+                subgraph_0.add_edge(i, neighbor, weight=G_0[i][neighbor]['weight'])
+
+        for neighbor in G_1.neighbors(j):
+            if neighbor in subgraph_1.nodes:
+                subgraph_1.add_edge(j, neighbor, weight=G_1[j][neighbor]['weight'])
+
+    return subgraph_0, subgraph_1, selected_pairs
+
+
+subgraph_0, subgraph_1, matched_pairs = extract_similar_subgraph(G_0, G_1, row_ind, col_ind,
+                                                                 similarity_matrix)
+
+spatial_coords_0 = np.array(spatial_coords_0)  
+spatial_coords_1 = np.array(spatial_coords_1)
+
+valid_indices_0 = [i for i, _, _ in matched_pairs if i < len(spatial_coords_0)]
+valid_indices_1 = [j for _, j, _ in matched_pairs if j < len(spatial_coords_1)]
+
+subgraph_coords_0 = np.array([spatial_coords_0[i] for i in valid_indices_0])
+subgraph_coords_1 = np.array([spatial_coords_1[j] for j in valid_indices_1])
+
+
+# Rigid point cloud registration
+def register_point_clouds(coords_0, coords_1):
+    centroid_0 = np.mean(coords_0, axis=0)
+    centroid_1 = np.mean(coords_1, axis=0)
+
+    centered_coords_0 = coords_0 - centroid_0
+    centered_coords_1 = coords_1 - centroid_1
+
+    H = np.dot(centered_coords_0.T, centered_coords_1)
+    U, S, Vt = np.linalg.svd(H)
+    R = np.dot(Vt.T, U.T)
+
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = np.dot(Vt.T, U.T)
+
+    t = centroid_1 - np.dot(R, centroid_0)
+    return R, t
+
+
+R, t = register_point_clouds(subgraph_coords_0, subgraph_coords_1)
+
+
+# Apply transformation to original data
+def apply_transformation(spatial_coords, R, t):
+    return np.dot(spatial_coords, R.T) + t
+
+
+aligned_coords_0 = apply_transformation(spatial_coords_0, R, t)
+aligned_coords_1 = spatial_coords_1  # sample 1 remains unchanged
+
+label_colors = {
+    'Olig2': '#FF0000', 'Astro': '#00FF00', 'PV': '#0000FF',
+    'L5': '#FFFF00', 'Olig1': '#00FFFF', 'L6': '#FF00FF',
+    'L2/3': '#808080', 'L4': '#800000'
+}
+
+# Extract real labels from adata
+labels_0 = adata_0.obs['cell_types'].astype(str)
+labels_1 = adata_1.obs['cell_types'].astype(str)
+
+# Plotting function for aligned results
+def plot_aligned_overlap(coords1, coords2, labels1, labels2, output_file=None):
+    plt.figure(figsize=(6, 6))
+    for label in np.unique(labels1):
+        idx = labels1 == label
+        plt.scatter(coords1[idx, 0], coords1[idx, 1],
+                    color=label_colors.get(label, 'gray'), s=5, alpha=0.8, label=f"Aligned Sample 1 - {label}")
+    for label in np.unique(labels2):
+        idx = labels2 == label
+        plt.scatter(coords2[idx, 0], coords2[idx, 1],
+                    color=label_colors.get(label, 'gray'), s=5, alpha=0.8, label=f"Sample 2 - {label}")
+    plt.axis('off')
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file, format='pdf')
+    else:
+        plt.show()
+    plt.close()
+
+output_dir = "/home/tlf/PICTUREOUT/AlignedOverlap/"
+os.makedirs(output_dir, exist_ok=True)
+
+plot_aligned_overlap(
+    aligned_coords_0,  
+    aligned_coords_1,  
+    labels_0,   
+    labels_1,   
+    output_file=f"{output_dir}aligned_overlap_starmap_gmsa.pdf"  
+)
+
+print("Alignment overlap visualization saved.")
